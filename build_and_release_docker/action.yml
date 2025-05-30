@@ -1,0 +1,173 @@
+name: Build and Release Docker Image
+description: Build and publish a Docker image to multiple registries
+inputs:
+  app_name:
+    description: 'Name of the application, will be used as the Docker image name'
+    required: true
+  versions:
+    description: 'List of versions to build, will each be used as a Docker image tag'
+    required: true
+  use_latest:
+    description: 'Use the latest version of the base image. Will always use the versions tags as well'
+    required: true
+    default: 'false'
+  architectures:
+    description: 'List of architectures to build the Docker image for'
+    required: true
+  override_image_creation_date:
+    description: 'Override the image creation date with a specific date (format: YYYY-MM-DD). If not set, the current date will be used.'
+    required: false
+    default: ''
+  dockerfile:
+    description: 'Path to the Dockerfile to use for building the Docker image. If not set, will use the default Dockerfile in the repository.'
+    required: false
+    default: ./Dockerfile
+  use_artifact:
+    description: 'Use the artifact from the previous job in the workflow. If false, will checkout the repository and build the Docker image from the source code.'
+    required: false
+    default: 'false'
+  artifact_name:
+    description: 'Name of the artifact to use if `use_artifact` is true.'
+    required: false
+    default: ''
+  artifact_path:
+    description: 'Path to the artifact to use if `use_artifact` is true.'
+    required: false
+    default: ''
+  publish_to_dockerhub:
+    description: 'Publish the Docker image to Docker Hub'
+    required: true
+    default: 'false'
+  docker_username:
+    description: 'Docker Hub username.'
+    required: false
+  docker_token:
+    description: 'Docker Hub token.'
+    required: false
+  publish_to_github_packages:
+    description: 'Publish the Docker image to GitHub Packages'
+    required: true
+    default: 'false'
+  github_token:
+    description: "GitHub token. Provide auto-included 'secrets.GITHUB_TOKEN'"
+    required: false
+  publish_to_gitea_packages:
+    description: 'Publish the Docker image to Gitea Packages'
+    required: true
+    default: 'false'
+  gitea_url:
+    description: 'Gitea registry URL, e.g. https://gitea.example.com'
+    required: false
+  gitea_username:
+    description: 'Gitea username.'
+    required: false
+  gitea_token:
+    description: 'Gitea token.'
+    required: false
+outputs: { }
+runs:
+  using: composite
+  steps:
+    - name: Checkout Repository (if not using artifact)
+      id: checkout
+      if: ${{ inputs.use_artifact == false }}
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Import artifact (if using artifact)
+      id: download-artifact
+      if: ${{ inputs.use_artifact == true }}
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ inputs.artifact_path }}
+
+    - name: Establish Variables
+      id: vars
+      shell: bash
+      run: |
+        echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_ENV"
+
+    - name: Set up QEMU
+      id: setup-qemu
+      uses: docker/setup-qemu-action@v2
+
+    - name: Set up Docker Buildx
+      id: setup-buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Login to Docker Hub (if enabled)
+      id: dockerhub-login
+      if: ${{ inputs.publish_to_dockerhub }}
+      uses: docker/login-action@v3
+      with:
+        registry: docker.io
+        username: ${{ inputs.docker_username }}
+        password: ${{ inputs.docker_token }}
+
+    - name: Login to GitHub Packages (if enabled)
+      id: gh-packages-login
+      if: ${{ inputs.publish_to_github_packages }}
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.triggering_actor }}
+        password: ${{ inputs.github_token }}
+
+    - name: Login to Gitea Packages (if enabled)
+      id: gitea-packages-login
+      if: ${{ inputs.publish_to_gitea_packages }}
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.gitea_url }}
+        username: ${{ inputs.gitea_username }}
+        password: ${{ inputs.gitea_token }}
+
+    - name: Establish Docker tags
+      id: docker-tags-vars
+      shell: bash
+      run: |
+        tags=()
+        if [ "${{ inputs.publish_to_dockerhub }}" = "true" ]; then
+            for version in "${{ inputs.versions }}"; do
+                tags+=("docker.io/${{ inputs.docker_username }}/${{ inputs.app_name }}:${version}")
+            done
+            if [ "${{ inputs.use_latest }}" = "true" ]; then
+                tags+=("docker.io/${{ inputs.docker_username }}/${{ inputs.app_name }}:latest")
+            fi
+        fi
+        if [ "${{ inputs.publish_to_github_packages }}" = "true" ]; then
+            for version in "${{ inputs.versions }}"; do
+                tags+=("ghcr.io/${{ github.repository_owner }}/${{ inputs.app_name }}:${version}")
+            done
+            if [ "${{ inputs.use_latest }}" = "true" ]; then
+                tags+=("ghcr.io/${{ github.repository_owner }}/${{ inputs.app_name }}:latest")
+            fi
+        fi
+        if [ "${{ inputs.publish_to_gitea_packages }}" = "true" ]; then
+            for version in "${{ inputs.versions }}"; do
+                tags+=("${{ inputs.gitea_url }}/${{ inputs.gitea_username }}/${{ inputs.app_name }}:${version}")
+            done
+            if [ "${{ inputs.use_latest }}" = "true" ]; then
+                tags+=("${{ inputs.gitea_url }}/${{ inputs.gitea_username }}/${{ inputs.app_name }}:latest")
+            fi
+        fi
+        echo "docker_tags=${{ join(tags, ',') }}" >> "$GITHUB_ENV"
+
+    - name: Build and Push Docker Images
+      id: docker-build-push
+      uses: docker/build-push-action@v3
+      with:
+        builder: ${{ steps.docker-buildx.outputs.name }}
+        context: ${{ inputs.use_artifact == true && steps.download-artifact.outputs.path || github.workspace }}
+        file: ${{ inputs.dockerfile }}
+        push: true
+        platforms: ${{ join(inputs.architectures, ',') }}
+        tags: |
+          ${{ join(fromJson(env.docker_tags), '\n') }}
+        labels:
+          org.opencontainers.image.title=${{ inputs.app_name }}
+          org.opencontainers.image.created=${{ inputs.override_image_creation_date || env.today }}
+
+
